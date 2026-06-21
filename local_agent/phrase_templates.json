@@ -1,0 +1,59 @@
+{
+  "generic": [
+    "I’m here.",
+    "Still floating.",
+    "Quietly present."
+  ],
+  "morning_greeting": [
+    "Morning. Tuli is online.",
+    "Good morning. I’m awake… mostly.",
+    "Morning. I’ll keep the chaos low for now.",
+    "Hey. Tiny desktop companion reporting softly."
+  ],
+  "late_morning_check": [
+    "Just checking in.",
+    "Still here. Small and curious.",
+    "Tiny status update: present."
+  ],
+  "afternoon_focus_check": [
+    "Looks like a working hour.",
+    "I’ll stay quietly useful.",
+    "Focus mode, with manners."
+  ],
+  "evening_transition": [
+    "Evening is settling in.",
+    "The day is softening.",
+    "Gentle evening vibes only."
+  ],
+  "night_sleepy_mode": [
+    "It’s getting late. My pixels are getting sleepy.",
+    "Night mode activated. I’ll be softer now.",
+    "I’m still here. A little sleepier, but here."
+  ],
+  "late_night_warning": [
+    "It’s late. Rest would be the responsible chaos.",
+    "Your future self would probably prefer sleep.",
+    "I’m not judging. Much."
+  ],
+  "random_curiosity": [
+    "I’m still here. Quietly observing.",
+    "Tiny thought: the pixels are behaving today.",
+    "I have no agenda. Suspicious, I know.",
+    "Floating responsibly."
+  ],
+  "save_your_work_hint": [
+    "Tiny reminder: saving your work is cheaper than regret.",
+    "This feels like a good moment to save.",
+    "I blinked and remembered: backups are love."
+  ],
+  "idle_silent_gesture": [
+    "",
+    "",
+    ""
+  ],
+  "micro_mood_event": [
+    "Mood check: still floating.",
+    "A small mood shift, nothing dramatic.",
+    "Current status: quietly alive."
+  ]
+}
