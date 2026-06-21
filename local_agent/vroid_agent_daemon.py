@@ -671,50 +671,41 @@ def maybe_generate_line_with_tuli_brain(
     max_words = int(event.get("max_words") or personality.get("behavior", {}).get("max_words_default", 14))
     recent = state.get("recent_lines", [])
     prompt = build_brain_event_prompt(event, state, max_words)
+    repeated_candidate = ""
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             response = TULI_BRAIN_RESPOND(prompt, speak=False)
         except Exception as exc:  # noqa: BLE001 - preserve daemon resilience.
             log_line("tuli_brain_event_error", event_type=event.get("event_type"), error=str(exc))
+            if repeated_candidate:
+                return repeated_candidate, "tuli_brain_repeated_fallback"
             return template_for_event(event["event_type"], templates), "tuli_brain_error"
 
         raw_text = strip_symbol_emoji(str(response.get("text", "")).strip())
         clean = clean_line(raw_text, max_words)
         if clean and not recent_line_match(clean, recent):
             return clean, "tuli_brain_ok"
-        if attempt == 0:
-            prompt += "\nAvoid reusing the same phrasing as the recent lines. Be fresher and slightly shorter."
+        if clean:
+            repeated_candidate = clean
+        if attempt < 2:
+            prompt += (
+                "\nAvoid reusing the same phrasing as the recent lines. "
+                "Be fresher, slightly shorter, and do not echo earlier greetings."
+            )
 
+    if repeated_candidate:
+        return repeated_candidate, "tuli_brain_repeated_fallback"
     return template_for_event(event["event_type"], templates), "tuli_brain_fallback"
 
 
 def maybe_generate_line(event: Dict[str, Any], state: Dict[str, Any], personality: Dict[str, Any], templates: Dict[str, List[str]]) -> Tuple[str, str]:
-    max_words = int(event.get("max_words") or personality.get("behavior", {}).get("max_words_default", 14))
     provider = str(personality.get("model_provider", "ollama")).lower()
     if provider in {"tuli_brain", "ollama"}:
-        text, reason = maybe_generate_line_with_tuli_brain(event, state, personality, templates)
-        if reason == "tuli_brain_ok":
-            return text, reason
-        if provider == "tuli_brain":
-            return text, reason
-    if provider != "ollama":
+        return maybe_generate_line_with_tuli_brain(event, state, personality, templates)
+    if provider != "tuli_brain":
         return template_for_event(event["event_type"], templates), "template_provider"
-
-    prompt = build_prompt(event, state, personality, max_words)
-    recent = state.get("recent_lines", [])
-    for attempt in range(2):
-        try:
-            raw = call_ollama(prompt, personality)
-        except Exception as exc:
-            log_line("model_error", event_type=event["event_type"], error=str(exc))
-            return template_for_event(event["event_type"], templates), "model_error"
-        clean = clean_line(raw, max_words)
-        if clean and not recent_line_match(clean, recent):
-            return clean, "model_ok"
-        if attempt == 0:
-            prompt += "\n\nAvoid repeating any recent lines. Be fresher, shorter, and more natural."
-    return template_for_event(event["event_type"], templates), "template_fallback"
+    return maybe_generate_line_with_tuli_brain(event, state, personality, templates)
 
 
 def chat_with_model(user_text: str, state: Dict[str, Any], personality: Dict[str, Any]) -> str:

@@ -1,6 +1,6 @@
 {
   "agent_name": "Tuli",
-  "model_provider": "ollama",
+  "model_provider": "tuli_brain",
   "model_name": "qwen3:1.7b",
   "spoken_language": "en",
   "tone": [
