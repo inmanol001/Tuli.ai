@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_SUPPORT="${HOME}/Library/Application Support/VroidOverlay"
+RUNTIME_DIR="${APP_SUPPORT}/local_agent_runtime"
+PLIST_ID="com.inma.vroid.localagent"
+PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_ID}.plist"
+
+echo "Project:"
+echo "  /Users/inma/Documents/Vroid"
+echo ""
+echo "Runtime:"
+echo "  ${RUNTIME_DIR}"
+echo ""
+echo "LaunchAgent plist:"
+echo "  ${PLIST_PATH}"
+echo ""
+echo "App launcher:"
+echo "  /Users/inma/Documents/Vroid/launch_tuli.command"
+echo ""
+echo "Brain launcher:"
+echo "  /Users/inma/Documents/Vroid/tuli_feature_rescue_kit_safe_no_ui_20260621_075513/run_restored_app_with_kokoro_env_ONLY.sh"
+echo ""
+echo "LaunchAgent status:"
+launchctl print "gui/$UID/${PLIST_ID}" 2>/dev/null | sed -n '1,40p' || echo "  not loaded"

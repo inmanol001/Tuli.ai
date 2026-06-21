@@ -1,49 +1,63 @@
 # Local Agent
 
-This folder contains the first local autonomy layer for VroidOverlay.
+This folder is the source of truth for Tuli's agent code.
 
-## Files
+## Official Paths
 
-- `personality.yaml`: voice, tone, and model settings.
-- `schedules.json`: event windows and cooldowns.
-- `phrase_templates.json`: fallback lines when the model is unavailable.
-- `agent_state.json`: persisted runtime state.
-- `vroid_agent_daemon.py`: the scheduler and decision loop.
-- `send_event.py`: pushes spoken or silent events to the avatar stream.
-- `run_once_test.py`: runs one scheduled event and exits.
-- `install_launch_agent.sh`: installs the daemon as a macOS LaunchAgent.
-- `uninstall_launch_agent.sh`: removes the LaunchAgent.
+- Source code: `/Users/inma/Documents/Vroid/local_agent`
+- Brain lab: `/Users/inma/Documents/Vroid/local_agent/tuli_local_brain_lab`
+- App launcher: `/Users/inma/Documents/Vroid/launch_tuli.command`
+- Live app support: `~/Library/Application Support/VroidOverlay`
+- Live runtime copy: `~/Library/Application Support/VroidOverlay/local_agent_runtime`
+- Live LaunchAgent label: `com.inma.vroid.localagent`
 
-## Quick Start
+## Canonical Flow
 
-Run one test event:
+1. Edit source files in this repo.
+2. Sync source to the live runtime copy.
+3. Restart or reinstall the LaunchAgent if needed.
+4. Launch the app through `launch_tuli.command`.
 
-```bash
-python3 local_agent/run_once_test.py morning_greeting
-```
+## Commands
 
-Run the daemon in the foreground:
+Sync the runtime copy:
 
 ```bash
-python3 local_agent/vroid_agent_daemon.py
+bash local_agent/sync_runtime.sh
 ```
 
-Install the background agent:
+Install or refresh the background agent:
 
 ```bash
 bash local_agent/install_launch_agent.sh
 ```
 
-Remove it:
+Remove the background agent:
 
 ```bash
 bash local_agent/uninstall_launch_agent.sh
 ```
 
+Inspect the current live setup:
+
+```bash
+bash local_agent/status.sh
+```
+
+Run one test event from source:
+
+```bash
+python3 local_agent/run_once_test.py morning_greeting
+```
+
+Run the source daemon in the foreground:
+
+```bash
+python3 local_agent/vroid_agent_daemon.py
+```
+
 ## Notes
 
-- Conversation memory is layered into short-term messages, medium-term summaries, and long-term summaries.
-- Older context is compacted automatically as it ages.
-- Spoken lines go through `openclaw_vroid_bridge.py`.
-- Silent gesture events are written directly to the JSONL event stream.
-- Logs are written to `local_agent/logs/agent.log`.
+- The live app should use `~/Library/Application Support/VroidOverlay/local_agent_runtime`, not `Documents/Vroid/local_agent` directly.
+- `openclaw_vroid_bridge.py` is synced both to app support root and to the runtime copy.
+- `agent_state.json` and runtime logs stay out of source control and are not overwritten during sync.
