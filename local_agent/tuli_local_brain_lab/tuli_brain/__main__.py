@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from .actions.event_bridge import emit_response_events
+from .activity import ActivityWatcher
 from .brain import respond
 from .config import load_config
+from .macos_control import MacOSControl
 from .memory.memory_policy import should_store_episodic_turn
 from .memory.sqlite_memory import SQLiteMemoryStore
 from .persona.context_builder import build_context
@@ -22,11 +25,28 @@ def _print_json(payload: Any) -> None:
 
 def _respond_with_optional_emit(user_text: str, *, speak: bool, emit: bool) -> dict:
     response = respond(user_text, speak=speak)
-    if emit:
+    if emit and "_emit" not in response:
         emit_result = emit_response_events(response, load_config().event_stream_path)
         response = dict(response)
         response["_emit"] = emit_result.to_dict()
     return response
+
+
+def _play_audio_path(audio_path: str) -> None:
+    subprocess.run(["/usr/bin/afplay", audio_path], check=True)
+
+
+def _play_voice_from_response(response: dict) -> bool:
+    for action in reversed(response.get("actions", [])):
+        if not isinstance(action, dict):
+            continue
+        if action.get("type") not in {"speech_start", "speech_end"}:
+            continue
+        audio_path = action.get("audio_path")
+        if isinstance(audio_path, str) and audio_path.strip():
+            _play_audio_path(audio_path)
+            return True
+    return False
 
 
 def _find_latest_audio(speech_output_dir: str) -> Path:
@@ -60,6 +80,10 @@ def _tail_file(path: str, *, lines: int, follow: bool) -> None:
                 print(line.rstrip(), flush=True)
             else:
                 time.sleep(0.5)
+
+
+def _session_id_from_env() -> str:
+    return os.environ.get("TULI_SESSION_ID", "local_session").strip() or "local_session"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -108,6 +132,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     memory_sub.add_parser("archive-trivial", help="Archive active trivial episodic turns.")
 
+    sessions_parser = memory_sub.add_parser("sessions", help="Inspect stored memory sessions.")
+    sessions_sub = sessions_parser.add_subparsers(dest="sessions_command", required=True)
+
+    sessions_sub.add_parser("current", help="Show the current session id and summary.")
+
+    sessions_list = sessions_sub.add_parser("list", help="List stored sessions.")
+    sessions_list.add_argument("--limit", type=int, default=20, help="Maximum sessions to print.")
+    sessions_list.add_argument("--all", action="store_true", help="Include archived sessions.")
+
+    session_show = sessions_sub.add_parser("show", help="Show one session by id.")
+    session_show.add_argument("session_id", help="Session id to inspect.")
+
+    session_summary = sessions_sub.add_parser("summary", help="Show the summary for one session.")
+    session_summary.add_argument("session_id", help="Session id to inspect.")
+
+    activity_parser = sub.add_parser("activity", help="Inspect privacy-conscious local activity.")
+    activity_sub = activity_parser.add_subparsers(dest="activity_command", required=True)
+
+    activity_sub.add_parser("stats", help="Print activity store counts and path.")
+
+    activity_list = activity_sub.add_parser("list", help="List recent activity records.")
+    activity_list.add_argument("--lines", type=int, default=20, help="Number of recent activity lines to print.")
+
+    activity_summary = activity_sub.add_parser("summary", help="Show a recent activity summary.")
+    activity_summary.add_argument("--lines", type=int, default=20, help="Number of recent activity lines to summarize.")
+
+    macos_parser = sub.add_parser("macos", help="Safely observe the current macOS frontmost state.")
+    macos_sub = macos_parser.add_subparsers(dest="macos_command", required=True)
+
+    macos_sub.add_parser("observe", help="Observe the current frontmost app and window.")
+
+    macos_record = macos_sub.add_parser("record", help="Observe and store one coarse activity record.")
+
     return parser
 
 
@@ -120,6 +177,13 @@ def main() -> int:
 
     if args.command == "ask":
         response = _respond_with_optional_emit(args.user_text, speak=args.voice, emit=args.emit)
+        if args.voice:
+            try:
+                _play_voice_from_response(response)
+            except FileNotFoundError as exc:
+                print(f"No pude reproducir la voz: {exc}")
+            except subprocess.CalledProcessError as exc:
+                print(f"No pude reproducir la voz local: {exc}")
         if args.json:
             _print_json(response)
         else:
@@ -141,6 +205,43 @@ def main() -> int:
         store.initialize()
         _print_json(build_context(args.user_text, store).to_dict())
         return 0
+
+    if args.command == "activity":
+        config = load_config()
+        watcher = ActivityWatcher(config.activity_store_path)
+
+        if args.activity_command == "stats":
+            _print_json(
+                {
+                    "path": str(watcher.path),
+                    "count": watcher.count(),
+                    "exists": watcher.exists(),
+                    "summary": watcher.summarize_recent(lines=20).to_dict(),
+                }
+            )
+            return 0
+
+        if args.activity_command == "list":
+            _print_json([record.to_dict() for record in watcher.list_recent(lines=args.lines)])
+            return 0
+
+        if args.activity_command == "summary":
+            _print_json(watcher.summarize_recent(lines=args.lines).to_dict())
+            return 0
+
+    if args.command == "macos":
+        config = load_config()
+        controller = MacOSControl()
+
+        if args.macos_command == "observe":
+            _print_json(controller.snapshot().to_dict())
+            return 0
+
+        if args.macos_command == "record":
+            watcher = ActivityWatcher(config.activity_store_path)
+            result = controller.record_activity(watcher)
+            _print_json(result.to_dict())
+            return 0
 
     if args.command == "speech":
         config = load_config()
@@ -167,6 +268,9 @@ def main() -> int:
                     "active_count": store.count(),
                     "total_count": store.count(include_archived=True),
                     "count_by_kind": store.count_by_kind(),
+                    "session_count": store.count_sessions(),
+                    "session_count_total": store.count_sessions(include_archived=True),
+                    "session_summary_count": store.count_session_summaries(),
                 }
             )
             return 0
@@ -195,6 +299,36 @@ def main() -> int:
                         archived.append(item.id)
             _print_json({"archived_count": len(archived), "archived_ids": archived})
             return 0
+
+        if args.memory_command == "sessions":
+            if args.sessions_command == "current":
+                session_id = _session_id_from_env()
+                _print_json(
+                    {
+                        "session_id": session_id,
+                        "session": store.get_session(session_id).to_dict() if store.get_session(session_id) else None,
+                        "summary": store.get_session_summary(session_id).to_dict() if store.get_session_summary(session_id) else None,
+                    }
+                )
+                return 0
+
+            if args.sessions_command == "list":
+                sessions = store.list_sessions(limit=args.limit, include_archived=args.all)
+                _print_json([session.to_dict() for session in sessions])
+                return 0
+
+            if args.sessions_command == "show":
+                session = store.get_session(args.session_id)
+                if session is None:
+                    _print_json({"session_id": args.session_id, "session": None})
+                    return 0
+                _print_json(session.to_dict())
+                return 0
+
+            if args.sessions_command == "summary":
+                summary = store.get_session_summary(args.session_id)
+                _print_json({"session_id": args.session_id, "summary": summary.to_dict() if summary else None})
+                return 0
 
     raise SystemExit(f"Unknown command: {args.command}")
 

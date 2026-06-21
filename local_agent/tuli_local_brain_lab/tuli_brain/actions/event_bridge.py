@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import json
-import uuid
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from .action_router import route_actions
+from ..events.jsonl_writer import write_jsonl_events
+from .action_router import route_response_actions
 
 
-EVENT_SCHEMA = "tuli_event.v1"
 EVENT_SOURCE = "tuli_brain"
+DEFAULT_SESSION_ID = "local_session"
 
 
 def utc_now() -> str:
@@ -19,7 +19,13 @@ def utc_now() -> str:
 
 
 def make_event_id() -> str:
-    return "evt_" + uuid.uuid4().hex[:12]
+    import uuid
+
+    return "msg_" + uuid.uuid4().hex[:12]
+
+
+def _session_id() -> str:
+    return os.environ.get("TULI_SESSION_ID", DEFAULT_SESSION_ID).strip() or DEFAULT_SESSION_ID
 
 
 @dataclass(frozen=True)
@@ -36,41 +42,70 @@ class EmitResult:
         }
 
 
-def _build_event(action: Dict[str, Any], *, response_text: str, response_emotion: str) -> Dict[str, Any]:
-    return {
-        "schema": EVENT_SCHEMA,
-        "id": make_event_id(),
-        "created_at": utc_now(),
+def _build_event(
+    action,
+    *,
+    response_text: str,
+    response_emotion: str,
+    turn_id: Optional[str] = None,
+    event_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    message_id = event_id or make_event_id()
+    request = action.request
+    payload: Dict[str, Any] = {
+        "type": request.type,
+        "id": message_id,
+        "ts": utc_now(),
+        "session_id": _session_id(),
+        "turn_id": turn_id or request.turn_id or message_id,
         "source": EVENT_SOURCE,
-        "action": action["type"],
-        "payload": action["payload"],
-        "response": {
-            "text": response_text,
-            "emotion": response_emotion,
-        },
     }
+
+    if request.type in {"bubble_show", "bubble_update", "speech_start", "text_delta"}:
+        payload["text"] = str(request.payload.get("text") or response_text)
+    if request.type == "emotion_hint":
+        payload["emotion"] = str(request.payload.get("emotion") or response_emotion)
+        payload["intensity"] = request.payload.get("intensity", 0.7)
+    if request.type in {"voice_request", "voice_started", "voice_finished"}:
+        voice = request.payload.get("voice")
+        if voice is not None:
+            payload["voice"] = str(voice)
+    if request.type == "speech_start":
+        payload["bubble"] = True
+    if request.type == "bubble_show":
+        payload["bubble"] = True
+    if request.payload:
+        payload["payload"] = dict(request.payload)
+
+    return payload
 
 
 def emit_response_events(response: Dict[str, Any], event_stream_path: str | Path) -> EmitResult:
-    path = Path(event_stream_path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    return emit_response_events_with_turn(response, event_stream_path)
 
-    actions = route_actions(response)
+
+def emit_response_events_with_turn(
+    response: Dict[str, Any],
+    event_stream_path: str | Path,
+    *,
+    turn_id: Optional[str] = None,
+) -> EmitResult:
+    path = Path(event_stream_path).expanduser()
+    routed = route_response_actions(response, turn_id=turn_id)
+    message_id = make_event_id()
     events = [
         _build_event(
             action,
             response_text=str(response.get("text", "")),
             response_emotion=str(response.get("emotion", "neutral")),
+            turn_id=turn_id,
+            event_id=message_id,
         )
-        for action in actions
+        for action in routed.actions
     ]
-
-    with path.open("a", encoding="utf-8") as stream:
-        for event in events:
-            stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
-
+    write_result = write_jsonl_events(path, events)
     return EmitResult(
-        path=str(path),
-        emitted_count=len(events),
-        event_ids=[event["id"] for event in events],
+        path=write_result["path"],
+        emitted_count=write_result["written_count"],
+        event_ids=[message_id for _ in events],
     )

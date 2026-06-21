@@ -1911,11 +1911,7 @@ static NSString *VroidOverlaySpeechTraceLogPath(void) {
     }
 
     if (say.length > 0) {
-        if (bubble == nil || bubble.boolValue) {
-            [self vroidSpeakText:say];
-        } else {
-            [self vroidSpeakText:say];
-        }
+        [self vroidSpeakText:say];
         [self vroidDebugLogEvent:command rawLine:nil action:@"speech_fallback" result:say];
     }
 }

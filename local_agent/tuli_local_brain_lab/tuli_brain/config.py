@@ -23,6 +23,8 @@ class TuliBrainConfig:
     response_stream_path: str = str(APP_SUPPORT / "tuli_responses.jsonl")
     memory_db_path: str = str(APP_SUPPORT / "tuli_brain.sqlite3")
     memory_jsonl_path: str = str(APP_SUPPORT / "tuli_memory.jsonl")
+    debug_store_path: str = str(APP_SUPPORT / "tuli_debug.jsonl")
+    activity_store_path: str = str(APP_SUPPORT / "tuli_activity.jsonl")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -64,6 +66,8 @@ def load_config() -> TuliBrainConfig:
         response_stream_path=_env_value("TULI_RESPONSE_STREAM_PATH", str(app_support / "tuli_responses.jsonl")),
         memory_db_path=_env_value("TULI_MEMORY_DB_PATH", str(app_support / "tuli_brain.sqlite3")),
         memory_jsonl_path=_env_value("TULI_MEMORY_JSONL_PATH", str(app_support / "tuli_memory.jsonl")),
+        debug_store_path=_env_value("TULI_DEBUG_STORE_PATH", str(app_support / "tuli_debug.jsonl")),
+        activity_store_path=_env_value("TULI_ACTIVITY_STORE_PATH", str(app_support / "tuli_activity.jsonl")),
     )
 
 

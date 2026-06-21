@@ -5,7 +5,24 @@ from typing import Any, Dict, Iterable, List
 
 
 VALID_EMOTIONS = frozenset({"happy", "thinking", "worried", "focused", "neutral"})
-VALID_ACTION_TYPES = frozenset({"bubble_show", "emotion_hint", "speech_start", "speech_end", "error"})
+VALID_ACTION_TYPES = frozenset(
+    {
+        "bubble_show",
+        "bubble_update",
+        "emotion_hint",
+        "voice_request",
+        "voice_started",
+        "voice_finished",
+        "speech_start",
+        "speech_end",
+        "memory_store_fact",
+        "memory_store_summary",
+        "debug_snapshot",
+        "activity_note",
+        "status_update",
+        "error",
+    }
+)
 
 
 class SchemaValidationError(ValueError):
@@ -38,13 +55,23 @@ def _validate_action(action: Dict[str, Any]) -> Dict[str, Any]:
         allowed = ", ".join(sorted(VALID_ACTION_TYPES))
         raise SchemaValidationError(f"action.type must be one of: {allowed}")
 
-    if action_type in {"bubble_show", "speech_start"}:
+    if action_type in {"bubble_show", "bubble_update", "speech_start"}:
         _require_string(action.get("text"), f"{action_type}.text")
     elif action_type == "emotion_hint":
         emotion = _require_string(action.get("emotion"), "emotion_hint.emotion")
         if emotion not in VALID_EMOTIONS:
             allowed = ", ".join(sorted(VALID_EMOTIONS))
             raise SchemaValidationError(f"emotion_hint.emotion must be one of: {allowed}")
+    elif action_type in {"voice_request", "voice_started", "voice_finished"}:
+        _require_string(action.get("voice"), f"{action_type}.voice")
+    elif action_type in {"memory_store_fact", "memory_store_summary"}:
+        _require_string(action.get("text"), f"{action_type}.text")
+    elif action_type == "debug_snapshot":
+        _require_string(action.get("session_id"), "debug_snapshot.session_id")
+    elif action_type == "activity_note":
+        _require_string(action.get("text"), "activity_note.text")
+    elif action_type == "status_update":
+        _require_string(action.get("text"), "status_update.text")
     elif action_type == "error":
         _require_string(action.get("message"), "error.message")
 

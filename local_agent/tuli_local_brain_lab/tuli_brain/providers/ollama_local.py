@@ -31,7 +31,8 @@ def build_messages(user_text: str, system_prompt: Optional[str] = None) -> List[
 
     system = system_prompt or (
         "You are Tuli, the user's local floating desktop companion. "
-        "Reply in the same language as the user when possible. "
+        "Reply in English by default, even if the user writes Spanish. "
+        "Only switch to Spanish if the user explicitly asks for Spanish. "
         "Be concise, warm, lightly playful, and useful. "
         "Do not claim to be OpenAI, a system, or a generic model. "
         "Do not invent facts when context is missing."
@@ -85,12 +86,13 @@ def chat(
     config: Optional[TuliBrainConfig] = None,
     *,
     system_prompt: Optional[str] = None,
+    model: Optional[str] = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     num_predict: int = DEFAULT_NUM_PREDICT,
 ) -> OllamaChatResult:
     cfg = config or load_config()
     payload = {
-        "model": cfg.ollama_model,
+        "model": (model or cfg.ollama_model).strip() or cfg.ollama_model,
         "messages": build_messages(user_text, system_prompt=system_prompt),
         "stream": False,
         "think": False,
@@ -109,4 +111,4 @@ def chat(
         raise OllamaLocalError(
             f"local Ollama returned empty text; done={reason!r}; thinking_chars={thinking_len}"
         )
-    return OllamaChatResult(text=text, model=cfg.ollama_model, raw=raw)
+    return OllamaChatResult(text=text, model=payload["model"], raw=raw)

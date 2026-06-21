@@ -8,8 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from .memory_types import MemoryQuery, MemorySummary, MemoryWriteResult, SessionRecord, SessionSummary
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SEED_SOURCE = "tuli_brain_seed_v1"
 
 
@@ -123,6 +124,35 @@ class SQLiteMemoryStore:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS sessions (
+                  session_id TEXT PRIMARY KEY,
+                  source TEXT NOT NULL,
+                  label TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  turn_count INTEGER DEFAULT 0,
+                  last_user_text TEXT,
+                  last_assistant_text TEXT,
+                  archived INTEGER DEFAULT 0,
+                  metadata_json TEXT DEFAULT '{}'
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_summaries (
+                  session_id TEXT PRIMARY KEY,
+                  text TEXT NOT NULL,
+                  source TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  memory_ids_json TEXT DEFAULT '[]',
+                  FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+                )
+                """
+            )
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS memories (
                   id TEXT PRIMARY KEY,
                   kind TEXT NOT NULL,
@@ -143,6 +173,8 @@ class SQLiteMemoryStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON memories(updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_archived ON sessions(archived)")
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
                 ("schema_version", str(SCHEMA_VERSION)),
@@ -248,6 +280,308 @@ class SQLiteMemoryStore:
             )
             conn.commit()
         return item
+
+    def upsert_session(
+        self,
+        session_id: str,
+        *,
+        source: str = "brain.respond",
+        label: Optional[str] = None,
+        last_user_text: Optional[str] = None,
+        last_assistant_text: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        archived: Optional[bool] = None,
+        count_turn: bool = False,
+    ) -> SessionRecord:
+        session_id = session_id.strip()
+        source = source.strip()
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if not source:
+            raise ValueError("source must not be empty")
+
+        now = utc_now()
+        metadata = dict(metadata or {})
+        turn_increment = 1 if count_turn and (last_user_text is not None or last_assistant_text is not None) else 0
+
+        with self.connect() as conn:
+            current = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if current is None:
+                conn.execute(
+                    """
+                    INSERT INTO sessions (
+                      session_id, source, label, created_at, updated_at,
+                      turn_count, last_user_text, last_assistant_text, archived, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        source,
+                        label,
+                        now,
+                        now,
+                        turn_increment,
+                        last_user_text,
+                        last_assistant_text,
+                        int(bool(archived)) if archived is not None else 0,
+                        json.dumps(metadata, ensure_ascii=False),
+                    ),
+                )
+            else:
+                new_metadata = metadata or self._safe_json_loads(current["metadata_json"] or "{}")
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET source = ?,
+                        label = COALESCE(?, label),
+                        updated_at = ?,
+                        turn_count = turn_count + ?,
+                        last_user_text = COALESCE(?, last_user_text),
+                        last_assistant_text = COALESCE(?, last_assistant_text),
+                        archived = COALESCE(?, archived),
+                        metadata_json = ?
+                    WHERE session_id = ?
+                    """,
+                    (
+                        source,
+                        label,
+                        now,
+                        turn_increment,
+                        last_user_text,
+                        last_assistant_text,
+                        int(archived) if archived is not None else None,
+                        json.dumps(new_metadata, ensure_ascii=False),
+                        session_id,
+                    ),
+                )
+            conn.commit()
+
+        return self.get_session(session_id) or SessionRecord(
+            session_id=session_id,
+            source=source,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def get_session(self, session_id: str) -> Optional[SessionRecord]:
+        session_id = session_id.strip()
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if row is None:
+            return None
+        return self._row_to_session(row)
+
+    def list_sessions(
+        self,
+        *,
+        limit: int = 20,
+        include_archived: bool = False,
+    ) -> List[SessionRecord]:
+        where = "" if include_archived else "WHERE archived = 0"
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM sessions
+                {where}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        return [self._row_to_session(row) for row in rows]
+
+    def count_sessions(self, *, include_archived: bool = False) -> int:
+        where = "" if include_archived else "WHERE archived = 0"
+        with self.connect() as conn:
+            return int(conn.execute(f"SELECT COUNT(*) AS count FROM sessions {where}").fetchone()["count"])
+
+    def count_session_summaries(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) AS count FROM session_summaries").fetchone()["count"])
+
+    def get_session_summary(self, session_id: str) -> Optional[SessionSummary]:
+        session_id = session_id.strip()
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_summaries WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_session_summary(row)
+
+    def save_session_summary(
+        self,
+        session_id: str,
+        text: str,
+        *,
+        source: str = "memory.summarizer",
+        memory_ids: Optional[Iterable[str]] = None,
+    ) -> SessionSummary:
+        session_id = session_id.strip()
+        text = text.strip()
+        source = source.strip()
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if not text:
+            raise ValueError("summary text must not be empty")
+        if not source:
+            raise ValueError("source must not be empty")
+
+        now = utc_now()
+        memory_ids_tuple = tuple(str(item).strip() for item in (memory_ids or ()) if str(item).strip())
+
+        self.upsert_session(session_id, source=source)
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO session_summaries (
+                  session_id, text, source, created_at, updated_at, memory_ids_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                  text = excluded.text,
+                  source = excluded.source,
+                  updated_at = excluded.updated_at,
+                  memory_ids_json = excluded.memory_ids_json
+                """,
+                (
+                    session_id,
+                    text,
+                    source,
+                    now,
+                    now,
+                    json.dumps(list(memory_ids_tuple), ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                (now, session_id),
+            )
+            conn.commit()
+
+        return SessionSummary(
+            session_id=session_id,
+            text=text,
+            source=source,
+            created_at=now,
+            updated_at=now,
+            memory_ids=memory_ids_tuple,
+        )
+
+    def query_memories(self, query: MemoryQuery) -> List[MemoryItem]:
+        clauses = []
+        params: List[Any] = []
+
+        if query.kind:
+            clauses.append("kind = ?")
+            params.append(query.kind)
+        if query.project:
+            clauses.append("project = ?")
+            params.append(query.project)
+        if query.session_id:
+            clauses.append("session_id = ?")
+            params.append(query.session_id)
+        if query.text:
+            terms = [
+                term.lower().strip(".,!?¿¡:;()[]{}\"'")
+                for term in query.text.split()
+                if len(term) >= 3
+            ]
+            terms = [term for term in terms if term and term not in SEARCH_STOPWORDS]
+            if terms:
+                clauses.extend(["text LIKE ?" for _ in terms])
+                params.extend([f"%{term}%" for term in terms])
+        if not query.include_archived:
+            clauses.append("archived = 0")
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(query.limit))
+        sql = f"""
+            SELECT * FROM memories
+            {where}
+            ORDER BY importance DESC, updated_at DESC
+            LIMIT ?
+        """
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_item(row) for row in rows]
+
+    def record_turn(
+        self,
+        *,
+        session_id: str,
+        user_text: str,
+        assistant_text: str,
+        source: str = "brain.respond",
+        importance: float = 0.45,
+        confidence: float = 0.8,
+        tags: Optional[Iterable[str]] = None,
+        project: Optional[str] = None,
+        summarize: bool = False,
+    ) -> MemoryWriteResult:
+        session_id = session_id.strip()
+        user_text = user_text.strip()
+        assistant_text = assistant_text.strip()
+        source = source.strip()
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if not user_text or not assistant_text:
+            raise ValueError("user_text and assistant_text must not be empty")
+
+        session = self.upsert_session(
+            session_id,
+            source=source,
+            last_user_text=user_text,
+            last_assistant_text=assistant_text,
+            count_turn=True,
+        )
+        if summarize:
+            summary_text = f"User: {user_text}\nTuli: {assistant_text}"
+            summary = self.save_session_summary(
+                session_id,
+                summary_text,
+                source=source,
+                memory_ids=(),
+            )
+            return MemoryWriteResult(
+                ok=True,
+                kind="session_summary",
+                item_id=session_id,
+                session_id=session_id,
+                source=source,
+                created_at=summary.created_at,
+                updated_at=summary.updated_at,
+                details={"summary": summary.to_dict()},
+            )
+
+        memory = self.add_memory(
+            kind="episodic",
+            text=f"User: {user_text}\nTuli: {assistant_text}",
+            source=source,
+            importance=importance,
+            confidence=confidence,
+            tags=list(tags or ("turn", "chat")),
+            project=project,
+            session_id=session_id,
+        )
+        return MemoryWriteResult(
+            ok=True,
+            kind=memory.kind,
+            item_id=memory.id,
+            session_id=session_id,
+            source=source,
+            created_at=memory.created_at,
+            updated_at=memory.updated_at,
+            details={"memory": memory.to_dict(), "session": session.to_dict()},
+        )
 
     def list_memories(
         self,
@@ -367,4 +701,45 @@ class SQLiteMemoryStore:
             session_id=row["session_id"],
             ttl=row["ttl"],
             archived=bool(row["archived"]),
+        )
+
+    @staticmethod
+    def _safe_json_loads(value: str) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(value or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _row_to_session(row: sqlite3.Row) -> SessionRecord:
+        metadata = SQLiteMemoryStore._safe_json_loads(row["metadata_json"] or "{}")
+        return SessionRecord(
+            session_id=row["session_id"],
+            source=row["source"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            label=row["label"],
+            turn_count=int(row["turn_count"] or 0),
+            last_user_text=row["last_user_text"],
+            last_assistant_text=row["last_assistant_text"],
+            archived=bool(row["archived"]),
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def _row_to_session_summary(row: sqlite3.Row) -> SessionSummary:
+        try:
+            memory_ids = json.loads(row["memory_ids_json"] or "[]")
+        except json.JSONDecodeError:
+            memory_ids = []
+        if not isinstance(memory_ids, list):
+            memory_ids = []
+        return SessionSummary(
+            session_id=row["session_id"],
+            text=row["text"],
+            source=row["source"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            memory_ids=tuple(str(item) for item in memory_ids if str(item).strip()),
         )
