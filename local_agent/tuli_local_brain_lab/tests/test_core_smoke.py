@@ -20,6 +20,7 @@ from tuli_brain.brain import respond
 from tuli_brain.config import TuliBrainConfig, load_config
 from tuli_brain.layout import LayoutManager, LayoutStateStore
 from tuli_brain.__main__ import _play_voice_from_response
+from tuli_brain.persona.context_builder import build_context
 from tuli_brain.debug import (
     build_inspector_snapshot,
     build_token_telemetry,
@@ -29,8 +30,11 @@ from tuli_brain.debug import (
     telemetry_to_event,
 )
 from tuli_brain.intents import ActionPlanner, IntentResolver
+from tuli_brain.memory import SessionSummary
+from tuli_brain.memory.sqlite_memory import MemoryItem, SQLiteMemoryStore
 from tuli_brain.providers.ollama_local import chat, chat_raw_messages
-from tuli_brain.router import AIIntentRouter, RouterDecision
+from tuli_brain.router import AIIntentRouter, RouterDecision, apply_post_router_semantic_guard, apply_pre_router_semantic_guard
+from tuli_brain.router.ai_intent_router import ROUTER_EXAMPLES, ROUTER_SYSTEM_PROMPT
 from tools.watch_token_context import parse_token_event
 from tuli_brain.macos_control import MacOSControl, PermissionCheckResult, WindowBounds, WindowProbeResult, WindowRecord
 from tuli_brain.macos_control.native_window_tiling import NativeTilingResult, NativeWindowTiling
@@ -324,7 +328,7 @@ class OllamaPayloadSmokeTest(unittest.TestCase):
         mock_chat_raw_messages.return_value = SimpleNamespace(text='{"route":"chat"}')
         config = TuliBrainConfig(router_model="router-model", router_num_ctx=8192, router_num_predict=500, ollama_keep_alive="10m")
 
-        AIIntentRouter().route("Tuli what can you do", config)
+        AIIntentRouter().route("Tuli tell me something about project planning", config)
 
         self.assertEqual(mock_chat_raw_messages.call_args.kwargs["num_ctx"], 8192)
         self.assertEqual(mock_chat_raw_messages.call_args.kwargs["num_predict"], 500)
@@ -569,6 +573,79 @@ class InspectorSnapshotSmokeTest(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             self.assertIn("agent", payload)
             self.assertIn("llm", payload)
+
+
+class ContextBuilderSmokeTest(unittest.TestCase):
+    @patch("tuli_brain.persona.context_builder.retrieve_relevant_memories")
+    def test_build_context_includes_capability_context_and_filters_toolish_memory(self, mock_retrieve) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteMemoryStore(str(Path(tmpdir) / "memory.sqlite3"))
+            store.initialize()
+            mock_retrieve.return_value = [
+                MemoryItem(
+                    id="mem_1",
+                    kind="episodic",
+                    text="DRY RUN: would execute window.native_tiling with {'action': 'left'}",
+                    source="test",
+                    created_at="2026-06-22T00:00:00Z",
+                    updated_at="2026-06-22T00:00:00Z",
+                )
+            ]
+
+            context = build_context("Tuli tell me about sales", store)
+            prompt = context.system_prompt
+
+            self.assertIn("Tuli capability context:", prompt)
+            self.assertIn("general knowledge", prompt)
+            self.assertIn("window.native_tiling", prompt)
+            self.assertIn("open permitted macOS apps", prompt)
+            self.assertIn("switch macOS Spaces", prompt)
+            self.assertIn("store, inspect, forget, and summarize local memories", prompt)
+            self.assertIn("avatar bubbles and emotion hints", prompt)
+            self.assertIn("full available tool layer", prompt)
+            self.assertIn("Do not say \"I'm not familiar with...\"", prompt)
+            self.assertNotIn("DRY RUN: would execute", prompt)
+            self.assertLess(len(prompt), 5000)
+
+    @patch("tuli_brain.persona.context_builder.retrieve_relevant_memories")
+    def test_build_context_compacts_technical_session_summary(self, mock_retrieve) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteMemoryStore(str(Path(tmpdir) / "memory.sqlite3"))
+            store.initialize()
+            store.save_session_summary(
+                "local_session",
+                "Latest turn -> User: move it left | Tuli: DRY RUN: would execute window.native_tiling with {'action': 'left'}",
+            )
+            mock_retrieve.return_value = []
+
+            context = build_context("Tuli tell me about sales", store)
+            prompt = context.system_prompt
+
+            self.assertIn("Recent session history summary:", prompt)
+            self.assertIn("Previous tool activity happened in a recent turn.", prompt)
+            self.assertIn("previous context only", prompt)
+            self.assertNotIn("DRY RUN: would execute", prompt)
+
+    @patch("tuli_brain.persona.context_builder.retrieve_relevant_memories")
+    def test_build_context_labels_activity_as_background_context(self, mock_retrieve) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SQLiteMemoryStore(str(Path(tmpdir) / "memory.sqlite3"))
+            store.initialize()
+            watcher = ActivityWatcher(str(Path(tmpdir) / "activity.jsonl"))
+            watcher.record_turn(
+                user_text="move it left",
+                response_text="DRY RUN: would execute window.native_tiling with {'action': 'left'}",
+                command_name="tool_chain",
+                route="ai_router_tool",
+                model_used="qwen3:1.7b",
+            )
+            mock_retrieve.return_value = []
+
+            context = build_context("Tuli tell me about sales", store, activity_watcher=watcher)
+            prompt = context.system_prompt
+
+            self.assertIn("Recent local activity history:", prompt)
+            self.assertIn("background context", prompt)
 
 
 class ToolCatalogSmokeTest(unittest.TestCase):
@@ -918,6 +995,188 @@ class IntentResolverSmokeTest(unittest.TestCase):
 
 
 class AIRouterSmokeTest(unittest.TestCase):
+    def test_router_prompt_includes_guardrail_warnings_and_examples(self) -> None:
+        self.assertIn("Do not choose macos.list_apps for general brainstorming", ROUTER_SYSTEM_PROMPT)
+        self.assertIn("Do not choose macos.observe_frontmost for window movement requests", ROUTER_SYSTEM_PROMPT)
+        self.assertIn("Do not choose macos.open_app for desktop or space navigation", ROUTER_SYSTEM_PROMPT)
+        example_texts = {item["user_text"] for item in ROUTER_EXAMPLES}
+        self.assertIn("Tuli put the current window on the right", example_texts)
+        self.assertIn("Tuli can you move windows?", example_texts)
+        self.assertIn("Tuli go to the previous desktop", example_texts)
+        self.assertIn("Tuli what windows do you see?", example_texts)
+        self.assertIn("Tuli give me three ideas to sell more", example_texts)
+        self.assertIn("hola Tuli", example_texts)
+
+    def test_pre_router_guard_handles_greeting(self) -> None:
+        decision = apply_pre_router_semantic_guard("hola Tuli")
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.route, "chat")
+        self.assertEqual(decision.reason, "Greeting-like text should stay on the normal chat path.")
+
+    def test_pre_router_guard_handles_switch_back(self) -> None:
+        decision = apply_pre_router_semantic_guard("Tuli switch back")
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.tool_name, "space.previous")
+
+    def test_pre_router_guard_handles_put_current_window_on_right(self) -> None:
+        decision = apply_pre_router_semantic_guard("Tuli put the current window on the right")
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.tool_name, "window.native_tiling")
+        self.assertEqual(decision.arguments["action"], "right")
+
+    def test_pre_router_guard_handles_move_this_window_to_left(self) -> None:
+        decision = apply_pre_router_semantic_guard("Tuli move this window to the left")
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.tool_name, "window.native_tiling")
+        self.assertEqual(decision.arguments["action"], "left")
+
+    def test_pre_router_guard_handles_capability_question(self) -> None:
+        decision = apply_pre_router_semantic_guard("Tuli can you move windows?")
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.route, "chat")
+        self.assertEqual(decision.reason, "The user is asking about Tuli's capabilities, not requesting execution.")
+
+    def test_pre_router_guard_handles_previous_desktop(self) -> None:
+        decision = apply_pre_router_semantic_guard("Tuli go to the previous desktop")
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.tool_name, "space.previous")
+
+    def test_pre_router_guard_handles_visible_windows_question(self) -> None:
+        decision = apply_pre_router_semantic_guard("Tuli what windows do you see?")
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.tool_name, "macos.visible_windows")
+
+    def test_pre_router_guard_handles_general_chat_sales(self) -> None:
+        decision = apply_pre_router_semantic_guard("Tuli tell me about sales")
+
+        self.assertIsNotNone(decision)
+        assert decision is not None
+        self.assertEqual(decision.route, "chat")
+
+    def test_post_router_guard_repairs_partial_left_window_action(self) -> None:
+        decision = apply_post_router_semantic_guard(
+            "Tuli move it left",
+            RouterDecision(route="tool", tool_name="", arguments={}, confidence=0.0, raw_text="Tuli move it left", raw_response='{"route":"tool"}'),
+        )
+
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.tool_name, "window.native_tiling")
+        self.assertEqual(decision.arguments["action"], "left")
+
+    def test_post_router_guard_rewrites_observe_frontmost_for_window_right(self) -> None:
+        decision = apply_post_router_semantic_guard(
+            "Tuli put the current window on the right",
+            RouterDecision(
+                route="tool",
+                tool_name="macos.observe_frontmost",
+                arguments={},
+                confidence=0.72,
+                raw_text="Tuli put the current window on the right",
+                raw_response='{"route":"tool","tool_name":"macos.observe_frontmost"}',
+            ),
+        )
+
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.tool_name, "window.native_tiling")
+        self.assertEqual(decision.arguments["action"], "right")
+        self.assertEqual(decision.reason, "A clear window placement request should use native window tiling.")
+
+    def test_post_router_guard_rewrites_capability_question_to_chat(self) -> None:
+        decision = apply_post_router_semantic_guard(
+            "Tuli can you move windows?",
+            RouterDecision(
+                route="tool",
+                tool_name="macos.observe_frontmost",
+                arguments={},
+                confidence=0.81,
+                raw_text="Tuli can you move windows?",
+                raw_response='{"route":"tool","tool_name":"macos.observe_frontmost"}',
+                reason="bad model guess",
+            ),
+        )
+
+        self.assertEqual(decision.route, "chat")
+        self.assertEqual(decision.tool_name, "")
+        self.assertEqual(decision.reason, "The user is asking about Tuli's capabilities, not requesting execution.")
+
+    def test_post_router_guard_rewrites_previous_desktop_open_app_guess(self) -> None:
+        decision = apply_post_router_semantic_guard(
+            "Tuli go to the previous desktop",
+            RouterDecision(
+                route="tool",
+                tool_name="macos.open_app",
+                arguments={"app_name": "desktop"},
+                confidence=0.72,
+                raw_text="Tuli go to the previous desktop",
+                raw_response='{"route":"tool","tool_name":"macos.open_app","arguments":{"app_name":"desktop"}}',
+                reason="The user wants to open something.",
+            ),
+        )
+
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.tool_name, "space.previous")
+        self.assertEqual(decision.reason, "A previous desktop request should map to the previous space action.")
+
+    def test_post_router_guard_rewrites_visible_windows_to_correct_tool(self) -> None:
+        decision = apply_post_router_semantic_guard(
+            "Tuli what windows do you see?",
+            RouterDecision(
+                route="tool",
+                tool_name="macos.observe_frontmost",
+                arguments={},
+                confidence=0.7,
+                raw_text="Tuli what windows do you see?",
+                raw_response='{"route":"tool","tool_name":"macos.observe_frontmost"}',
+            ),
+        )
+
+        self.assertEqual(decision.route, "tool")
+        self.assertEqual(decision.tool_name, "macos.visible_windows")
+
+    def test_post_router_guard_rewrites_sales_ideas_to_chat(self) -> None:
+        decision = apply_post_router_semantic_guard(
+            "Tuli give me three ideas to sell more",
+            RouterDecision(
+                route="tool",
+                tool_name="macos.list_apps",
+                arguments={},
+                confidence=0.73,
+                raw_text="Tuli give me three ideas to sell more",
+                raw_response='{"route":"tool","tool_name":"macos.list_apps"}',
+            ),
+        )
+
+        self.assertEqual(decision.route, "chat")
+        self.assertEqual(decision.tool_name, "")
+
+    def test_post_router_guard_repairs_open_it_to_clarify(self) -> None:
+        decision = apply_post_router_semantic_guard(
+            "Tuli open it",
+            RouterDecision(route="tool", tool_name="macos.open_app", arguments={}, confidence=0.0, raw_text="Tuli open it", raw_response='{"route":"tool"}'),
+        )
+
+        self.assertEqual(decision.route, "clarify")
+        self.assertIn("Which app", decision.clarification)
+
     def test_router_valid_tool_json_parses(self) -> None:
         decision = AIIntentRouter().parse_response(
             "Tuli move it left",

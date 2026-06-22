@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from ..config import TuliBrainConfig, load_config
 from ..providers.ollama_local import OllamaLocalError, chat_raw_messages
 from ..tools import DEFAULT_TOOL_CATALOG, ToolCatalog
+from .semantic_guards import apply_post_router_semantic_guard, apply_pre_router_semantic_guard
 from .router_types import RouterDecision
 
 
@@ -52,16 +53,6 @@ ACTION_HINT_TOKENS = (
     "recuerda",
     "olvida",
 )
-GREETING_HINT_TOKENS = (
-    "hola",
-    "hello",
-    "hi",
-    "hey",
-    "buenas",
-    "good morning",
-    "good afternoon",
-    "good evening",
-)
 ROUTER_SYSTEM_PROMPT = (
     "You are Tuli's intent router. "
     "Return only valid JSON. "
@@ -77,6 +68,9 @@ ROUTER_SYSTEM_PROMPT = (
     "Never include commentary outside JSON. "
     "For route tool, always include tool_name and arguments. "
     "For route clarify, include a short clarification question. "
+    "Do not choose macos.list_apps for general brainstorming, sales, marketing, writing, or knowledge questions. "
+    "Do not choose macos.observe_frontmost for window movement requests. Use window.native_tiling. "
+    "Do not choose macos.open_app for desktop or space navigation. Use space tools. "
     'Return an object with keys: route, tool_name, arguments, confidence, clarification, reason.'
 )
 ROUTER_EXAMPLES = (
@@ -92,6 +86,50 @@ ROUTER_EXAMPLES = (
         },
     },
     {
+        "user_text": "Tuli put the current window on the right",
+        "json": {
+            "route": "tool",
+            "tool_name": "window.native_tiling",
+            "arguments": {"action": "right"},
+            "confidence": 0.92,
+            "clarification": "",
+            "reason": "The user wants to place the current window on the right.",
+        },
+    },
+    {
+        "user_text": "Tuli can you move windows?",
+        "json": {
+            "route": "chat",
+            "tool_name": "",
+            "arguments": {},
+            "confidence": 0.90,
+            "clarification": "",
+            "reason": "The user is asking about Tuli's capabilities, not requesting execution.",
+        },
+    },
+    {
+        "user_text": "Tuli go to the previous desktop",
+        "json": {
+            "route": "tool",
+            "tool_name": "space.previous",
+            "arguments": {},
+            "confidence": 0.90,
+            "clarification": "",
+            "reason": "The user wants to move to the previous desktop.",
+        },
+    },
+    {
+        "user_text": "Tuli what windows do you see?",
+        "json": {
+            "route": "tool",
+            "tool_name": "macos.visible_windows",
+            "arguments": {},
+            "confidence": 0.90,
+            "clarification": "",
+            "reason": "The user wants a list of visible windows.",
+        },
+    },
+    {
         "user_text": "Tuli tell me about sales",
         "json": {
             "route": "chat",
@@ -100,6 +138,28 @@ ROUTER_EXAMPLES = (
             "confidence": 0.90,
             "clarification": "",
             "reason": "The user is asking a general business question.",
+        },
+    },
+    {
+        "user_text": "Tuli give me three ideas to sell more",
+        "json": {
+            "route": "chat",
+            "tool_name": "",
+            "arguments": {},
+            "confidence": 0.90,
+            "clarification": "",
+            "reason": "The user is asking for brainstorming and sales ideas.",
+        },
+    },
+    {
+        "user_text": "hola Tuli",
+        "json": {
+            "route": "chat",
+            "tool_name": "",
+            "arguments": {},
+            "confidence": 0.90,
+            "clarification": "",
+            "reason": "This is a greeting and should stay on the chat path.",
         },
     },
     {
@@ -186,15 +246,6 @@ def _normalize_text(text: str) -> str:
     return " ".join(str(text or "").strip().lower().split())
 
 
-def _looks_greeting_like(user_text: str) -> bool:
-    lowered = _normalize_text(user_text)
-    if not lowered:
-        return False
-    if lowered in {"hola tuli", "hello tuli", "hi tuli", "hey tuli", "tuli hola", "tuli hello", "tuli hi", "tuli hey"}:
-        return True
-    return any(lowered.startswith(token + " ") or lowered == token for token in GREETING_HINT_TOKENS)
-
-
 def _compact_catalog(catalog: ToolCatalog) -> List[Dict[str, Any]]:
     compact: List[Dict[str, Any]] = []
     for spec in catalog.enabled_tools():
@@ -221,6 +272,11 @@ class AIIntentRouter:
         _trace(f"num_ctx: {cfg.router_num_ctx}")
         _trace(f"num_predict: {cfg.router_num_predict}")
         _trace(f"user_text: {user_text}")
+        pre_guard_decision = apply_pre_router_semantic_guard(user_text)
+        if pre_guard_decision is not None:
+            _trace(f"decision: {json.dumps(pre_guard_decision.to_dict(), ensure_ascii=False)}")
+            _trace("validation: ok (pre-router-guard)")
+            return pre_guard_decision
         try:
             raw_response = self._request_router_response(user_text, cfg)
         except OllamaLocalError as exc:
@@ -293,7 +349,7 @@ class AIIntentRouter:
         )
 
     def validate_decision(self, decision: RouterDecision) -> RouterDecision:
-        decision = self._apply_preferred_heuristics(decision)
+        decision = apply_post_router_semantic_guard(decision.raw_text, decision)
 
         if decision.route not in ALLOWED_ROUTES:
             return RouterDecision(
@@ -313,9 +369,9 @@ class AIIntentRouter:
             return RouterDecision(**{**decision.to_dict(), "clarification": clarification})
 
         if not decision.tool_name:
-            inferred = self._infer_partial_tool_decision(decision)
-            if inferred is not None:
-                decision = inferred
+            guarded = apply_post_router_semantic_guard(decision.raw_text, decision)
+            if guarded.tool_name:
+                decision = guarded
             else:
                 return self._clarify_decision(decision, "I understood this as an action, but I need a clearer command.", "missing_tool_name")
 
@@ -356,50 +412,6 @@ class AIIntentRouter:
             error=None,
         )
 
-    def _apply_preferred_heuristics(self, decision: RouterDecision) -> RouterDecision:
-        lowered = _normalize_text(decision.raw_text)
-
-        if _looks_greeting_like(lowered):
-            return RouterDecision(
-                route="chat",
-                tool_name="",
-                arguments={},
-                confidence=max(decision.confidence, 0.8),
-                clarification="",
-                reason=decision.reason or "Greeting-like text should stay on the normal chat path.",
-                raw_text=decision.raw_text,
-                raw_response=decision.raw_response,
-                error=None,
-            )
-
-        if "switch back" in lowered:
-            return RouterDecision(
-                route="tool",
-                tool_name="space.previous",
-                arguments={},
-                confidence=max(decision.confidence, 0.8),
-                clarification="",
-                reason=decision.reason or "Switch back should map to the previous desktop.",
-                raw_text=decision.raw_text,
-                raw_response=decision.raw_response,
-                error=None,
-            )
-
-        if "open it" in lowered and decision.tool_name == "macos.open_app" and not decision.arguments:
-            return RouterDecision(
-                route="clarify",
-                tool_name="macos.open_app",
-                arguments={},
-                confidence=max(decision.confidence, 0.72),
-                clarification="Which app do you want me to open?",
-                reason=decision.reason or "Open request is missing the app name.",
-                raw_text=decision.raw_text,
-                raw_response=decision.raw_response,
-                error="missing_required_argument",
-            )
-
-        return decision
-
     def _invalid_json_decision(self, user_text: str, raw_response: str) -> RouterDecision:
         if _looks_action_like(user_text):
             return RouterDecision(
@@ -439,76 +451,6 @@ class AIIntentRouter:
             raw_response="",
             error=error,
         )
-
-    def _infer_partial_tool_decision(self, decision: RouterDecision) -> Optional[RouterDecision]:
-        lowered = _normalize_text(decision.raw_text)
-
-        if any(phrase in lowered for phrase in ("move it left", "put it on the left", "snap this window left", "snap it left")):
-            return RouterDecision(
-                route="tool",
-                tool_name="window.native_tiling",
-                arguments={"action": "left"},
-                confidence=max(decision.confidence, 0.78),
-                clarification="",
-                reason=decision.reason or "Heuristic fallback inferred a left window tiling action.",
-                raw_text=decision.raw_text,
-                raw_response=decision.raw_response,
-                error=None,
-            )
-
-        if any(phrase in lowered for phrase in ("move it right", "put it on the right", "snap this window right", "snap it right")):
-            return RouterDecision(
-                route="tool",
-                tool_name="window.native_tiling",
-                arguments={"action": "right"},
-                confidence=max(decision.confidence, 0.78),
-                clarification="",
-                reason=decision.reason or "Heuristic fallback inferred a right window tiling action.",
-                raw_text=decision.raw_text,
-                raw_response=decision.raw_response,
-                error=None,
-            )
-
-        if "switch back" in lowered:
-            return RouterDecision(
-                route="tool",
-                tool_name="space.previous",
-                arguments={},
-                confidence=max(decision.confidence, 0.76),
-                clarification="",
-                reason=decision.reason or "Heuristic fallback inferred the previous desktop action.",
-                raw_text=decision.raw_text,
-                raw_response=decision.raw_response,
-                error=None,
-            )
-
-        if "open it" in lowered:
-            return RouterDecision(
-                route="clarify",
-                tool_name="macos.open_app",
-                arguments={},
-                confidence=max(decision.confidence, 0.72),
-                clarification="Which app do you want me to open?",
-                reason=decision.reason or "Heuristic fallback inferred an app-open request with a missing app name.",
-                raw_text=decision.raw_text,
-                raw_response=decision.raw_response,
-                error="missing_required_argument",
-            )
-
-        if "can you see my desktop" in lowered:
-            return RouterDecision(
-                route="tool",
-                tool_name="macos.visible_windows",
-                arguments={},
-                confidence=max(decision.confidence, 0.75),
-                clarification="",
-                reason=decision.reason or "Heuristic fallback inferred a desktop visibility question.",
-                raw_text=decision.raw_text,
-                raw_response=decision.raw_response,
-                error=None,
-            )
-
-        return None
 
     def _clarify_decision(self, decision: RouterDecision, clarification: str, error: str) -> RouterDecision:
         return RouterDecision(
