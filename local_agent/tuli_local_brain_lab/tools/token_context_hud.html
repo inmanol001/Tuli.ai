@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Tuli Token Context HUD</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; background: #111827; color: #e5e7eb; margin: 0; padding: 24px; }
+    textarea { width: 100%; min-height: 180px; background: #0f172a; color: #e5e7eb; border: 1px solid #334155; padding: 12px; }
+    pre { background: #0f172a; border: 1px solid #334155; padding: 16px; white-space: pre-wrap; }
+    button { padding: 10px 14px; margin: 12px 0; }
+  </style>
+</head>
+<body>
+  <h1>Tuli Token Context HUD</h1>
+  <textarea id="input" placeholder="Paste token_context_update JSON lines here"></textarea>
+  <br>
+  <button onclick="renderHud()">Render HUD</button>
+  <pre id="output">Waiting for input...</pre>
+  <script>
+    function parseTokenEvent(line) {
+      try {
+        const payload = JSON.parse(line);
+        if (payload.type !== "token_context_update") return null;
+        return payload;
+      } catch (_) {
+        return null;
+      }
+    }
+    function summarize(event) {
+      if (!event) return { model: "-", num_ctx: 0, num_predict: 0, context: 0, percent: 0, output: 0, last: "-" };
+      return {
+        model: event.model || "-",
+        num_ctx: event.num_ctx || 0,
+        num_predict: event.num_predict || 0,
+        context: event.actual_prompt_tokens || event.approx_prompt_tokens || 0,
+        percent: event.context_percent_actual ?? event.context_percent_estimated ?? 0,
+        output: event.actual_output_tokens || 0,
+        last: event.total_duration ? `${(event.total_duration / 1e9).toFixed(1)}s` : "-"
+      };
+    }
+    function renderHud() {
+      const lines = document.getElementById("input").value.split(/\n+/);
+      let router = null;
+      let chat = null;
+      for (const line of lines) {
+        const event = parseTokenEvent(line);
+        if (!event) continue;
+        if (event.model_role === "router") router = event;
+        if (event.model_role === "chat") chat = event;
+      }
+      const r = summarize(router);
+      const c = summarize(chat);
+      document.getElementById("output").textContent =
+`TULI TOKEN CONTEXT LIVE
+────────────────────────────────────
+Router ${r.model}
+Context: ${r.context} / ${r.num_ctx}   ${r.percent.toFixed(1)}%
+Output: ${r.output} / ${r.num_predict}
+Last: ${r.last}
+
+Chat ${c.model}
+Context: ${c.context} / ${c.num_ctx}   ${c.percent.toFixed(1)}%
+Output: ${c.output} / ${c.num_predict}
+Last: ${c.last}`;
+    }
+  </script>
+</body>
+</html>

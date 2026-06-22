@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import plistlib
 import subprocess
 import uuid
 from datetime import datetime
@@ -89,6 +91,43 @@ def _normalize_application_name(app_name: str) -> str:
     return clean
 
 
+def _apple_script_string_literal(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _candidate_application_bundle_paths(app_name: str) -> list[Path]:
+    clean = _sanitize_text(app_name).strip().strip("\"'")
+    bundle_name = f"{clean}.app"
+    if bundle_name == ".app":
+        return []
+
+    candidates = [
+        Path("/Applications") / bundle_name,
+        Path.home() / "Applications" / bundle_name,
+        Path("/System/Applications") / bundle_name,
+    ]
+    return [candidate for candidate in candidates if candidate.exists()]
+
+
+def _bundle_executable_path(bundle_path: Path) -> Optional[Path]:
+    info_plist = bundle_path / "Contents" / "Info.plist"
+    if not info_plist.exists():
+        return None
+
+    try:
+        with info_plist.open("rb") as handle:
+            plist = plistlib.load(handle)
+    except Exception:
+        return None
+
+    executable_name = plist.get("CFBundleExecutable")
+    if not isinstance(executable_name, str) or not executable_name.strip():
+        executable_name = bundle_path.stem
+
+    executable_path = bundle_path / "Contents" / "MacOS" / executable_name
+    return executable_path if executable_path.exists() else None
+
+
 def list_known_applications() -> list[str]:
     """Return the app names Tuli recognizes by default."""
     return list(_KNOWN_APPLICATIONS)
@@ -117,6 +156,118 @@ class MacOSControl:
             stderr = (exc.stderr or exc.stdout or "").strip()
             raise MacOSControlError(f"osascript failed: {stderr or exc.returncode}") from exc
         return result.stdout.strip()
+
+    def _visible_frame(self) -> Optional[Dict[str, int]]:
+        swift_script = r'''
+import AppKit
+import Foundation
+
+let screen = NSScreen.main ?? NSScreen.screens.first
+guard let frame = screen?.visibleFrame else {
+    exit(1)
+}
+
+let payload: [String: Double] = [
+    "x": frame.origin.x,
+    "y": frame.origin.y,
+    "width": frame.size.width,
+    "height": frame.size.height
+]
+
+let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+if let string = String(data: data, encoding: .utf8) {
+    print(string)
+}
+'''
+        try:
+            result = subprocess.run(
+                ["/usr/bin/swift", "-e", swift_script],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            return None
+
+        output = (result.stdout or "").strip()
+        if not output:
+            return None
+
+        try:
+            raw = json.loads(output)
+        except json.JSONDecodeError:
+            return None
+
+        try:
+            return {
+                "x": int(round(float(raw["x"]))),
+                "y": int(round(float(raw["y"]))),
+                "width": int(round(float(raw["width"]))),
+                "height": int(round(float(raw["height"]))),
+            }
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _fit_frontmost_window_to_visible_frame(self, app_name: str) -> bool:
+        frame = self._visible_frame()
+        if not frame:
+            return False
+
+        app_literal = _apple_script_string_literal(app_name)
+        script = f'''
+tell application "System Events"
+    repeat with attempt from 1 to 30
+        if exists process {app_literal} then
+            exit repeat
+        end if
+        delay 0.1
+    end repeat
+
+    tell process {app_literal}
+        set frontmost to true
+        repeat with attempt from 1 to 30
+            if (count of windows) > 0 then
+                exit repeat
+            end if
+            delay 0.1
+        end repeat
+
+        if (count of windows) > 0 then
+            set frontWindow to front window
+            set position of frontWindow to {{{frame["x"]}, {frame["y"]}}}
+            set size of frontWindow to {{{frame["width"]}, {frame["height"]}}}
+            return "adjusted"
+        end if
+    end tell
+end tell
+return "no_window"
+'''
+        try:
+            result = self._run_osascript(script)
+        except MacOSControlError:
+            return False
+        return result == "adjusted"
+
+    def _run_open_command(self, open_args: list[str]) -> None:
+        subprocess.run(
+            open_args,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=self.timeout_seconds,
+        )
+
+    def _launch_bundle_executable(self, bundle_path: Path) -> bool:
+        executable_path = _bundle_executable_path(bundle_path)
+        if executable_path is None:
+            return False
+
+        try:
+            subprocess.Popen([str(executable_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (FileNotFoundError, OSError):
+            return False
 
     def observe_frontmost_state(self) -> MacOSObservation:
         script = r'''
@@ -178,13 +329,7 @@ class MacOSControl:
             )
 
         try:
-            subprocess.run(
-                ["/usr/bin/open", "-a", normalized],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-            )
+            self._run_open_command(["/usr/bin/open", "-a", normalized])
         except FileNotFoundError as exc:
             return MacOSControlResult(
                 ok=False,
@@ -201,12 +346,30 @@ class MacOSControl:
             )
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or exc.stdout or "").strip()
-            return MacOSControlResult(
-                ok=False,
-                operation="open_application",
-                status="error",
-                error={"message": stderr or f"could not open {normalized}", "source": DEFAULT_SOURCE},
-            )
+            bundle_candidates = _candidate_application_bundle_paths(normalized)
+            if "Unable to find application named" in stderr and bundle_candidates:
+                try:
+                    self._run_open_command(["/usr/bin/open", str(bundle_candidates[0])])
+                except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as fallback_exc:
+                    if not self._launch_bundle_executable(bundle_candidates[0]):
+                        fallback_stderr = ""
+                        if isinstance(fallback_exc, subprocess.CalledProcessError):
+                            fallback_stderr = (fallback_exc.stderr or fallback_exc.stdout or "").strip()
+                        return MacOSControlResult(
+                            ok=False,
+                            operation="open_application",
+                            status="error",
+                            error={"message": fallback_stderr or stderr or f"could not open {normalized}", "source": DEFAULT_SOURCE},
+                        )
+            else:
+                return MacOSControlResult(
+                    ok=False,
+                    operation="open_application",
+                    status="error",
+                    error={"message": stderr or f"could not open {normalized}", "source": DEFAULT_SOURCE},
+                )
+
+        self._fit_frontmost_window_to_visible_frame(normalized)
 
         observation = None
         try:

@@ -63,6 +63,17 @@ static NSString *VroidOverlaySpeechTraceLogPath(void) {
     return [dir stringByAppendingPathComponent:@"speech_trace.jsonl"];
 }
 
+static NSString *VroidOverlayEventStreamPath(void) {
+    NSString *override = [[[NSProcessInfo processInfo] environment] objectForKey:@"VROID_EVENT_STREAM_PATH"];
+    if (override.length > 0) {
+        return [override stringByStandardizingPath];
+    }
+
+    NSString *dir = VroidOverlaySupportDirectoryPath();
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:@"openclaw_stream.jsonl"];
+}
+
 @protocol RotationControlUpdating <NSObject>
 - (void)refreshFromSceneView;
 @end
@@ -3296,7 +3307,11 @@ static NSString *VroidOverlaySpeechTraceLogPath(void) {
 @property (nonatomic, strong) NSMenuItem *memoryModeItem;
 @property (nonatomic, strong) NSWindow *logsWindow;
 @property (nonatomic, strong) NSTextView *logsTextView;
+@property (nonatomic, strong) NSTextView *logsTelemetryTextView;
 @property (nonatomic, strong) NSTimer *logsRefreshTimer;
+@property (nonatomic, assign) NSTimeInterval logsLastInspectorRefreshTime;
+@property (nonatomic, assign) NSTimeInterval logsLastRawRefreshTime;
+@property (nonatomic, copy) NSString *logsCachedInspectorText;
 @end
 
 @implementation AppDelegate
@@ -3319,7 +3334,7 @@ static NSString *VroidOverlaySpeechTraceLogPath(void) {
 
 - (void)vroidShowLogsWindow:(id)sender {
     if (self.logsWindow == nil) {
-        NSRect frame = NSMakeRect(0, 0, 720, 460);
+        NSRect frame = NSMakeRect(0, 0, 860, 640);
         NSWindow *window = [[NSWindow alloc]
             initWithContentRect:frame
                       styleMask:(NSWindowStyleMaskTitled |
@@ -3327,29 +3342,56 @@ static NSString *VroidOverlaySpeechTraceLogPath(void) {
                                  NSWindowStyleMaskResizable)
                         backing:NSBackingStoreBuffered
                           defer:NO];
-        window.title = @"VroidOverlay Logs";
+        window.title = @"Tuli Inspector";
         window.releasedWhenClosed = NO;
-        window.minSize = NSMakeSize(520, 320);
+        window.minSize = NSMakeSize(720, 480);
 
-        NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:frame];
+        NSSplitView *splitView = [[NSSplitView alloc] initWithFrame:frame];
+        splitView.vertical = NO;
+        splitView.dividerStyle = NSSplitViewDividerStyleThin;
+        splitView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+        NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 180, NSWidth(frame), NSHeight(frame) - 180)];
         scrollView.hasVerticalScroller = YES;
         scrollView.hasHorizontalScroller = YES;
         scrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 
-        NSTextView *textView = [[NSTextView alloc] initWithFrame:frame];
+        NSTextView *textView = [[NSTextView alloc] initWithFrame:scrollView.bounds];
         textView.editable = NO;
         textView.selectable = YES;
         textView.font = [NSFont fontWithName:@"Menlo" size:11.0] ?: [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightRegular];
-        textView.backgroundColor = [NSColor colorWithCalibratedWhite:0.10 alpha:1.0];
-        textView.textColor = [NSColor colorWithCalibratedWhite:0.92 alpha:1.0];
+        textView.backgroundColor = [NSColor colorWithCalibratedWhite:0.07 alpha:1.0];
+        textView.textColor = [NSColor colorWithCalibratedWhite:0.95 alpha:1.0];
         textView.automaticQuoteSubstitutionEnabled = NO;
         textView.automaticDashSubstitutionEnabled = NO;
         textView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         scrollView.documentView = textView;
 
-        window.contentView = scrollView;
+        NSScrollView *telemetryScrollView = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(frame), 180)];
+        telemetryScrollView.hasVerticalScroller = YES;
+        telemetryScrollView.hasHorizontalScroller = YES;
+        telemetryScrollView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+        NSTextView *telemetryTextView = [[NSTextView alloc] initWithFrame:telemetryScrollView.bounds];
+        telemetryTextView.editable = NO;
+        telemetryTextView.selectable = YES;
+        telemetryTextView.font = [NSFont fontWithName:@"Menlo" size:11.0] ?: [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightRegular];
+        telemetryTextView.backgroundColor = [NSColor colorWithCalibratedWhite:0.10 alpha:1.0];
+        telemetryTextView.textColor = [NSColor colorWithCalibratedRed:0.63 green:0.92 blue:0.82 alpha:1.0];
+        telemetryTextView.automaticQuoteSubstitutionEnabled = NO;
+        telemetryTextView.automaticDashSubstitutionEnabled = NO;
+        telemetryTextView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        telemetryScrollView.documentView = telemetryTextView;
+
+        [splitView addSubview:scrollView];
+        [splitView addSubview:telemetryScrollView];
+        [splitView adjustSubviews];
+        [splitView setPosition:(NSHeight(frame) - 220.0) ofDividerAtIndex:0];
+
+        window.contentView = splitView;
         self.logsWindow = window;
         self.logsTextView = textView;
+        self.logsTelemetryTextView = telemetryTextView;
     }
 
     [self vroidRefreshLogsWindowContents];
@@ -3357,7 +3399,7 @@ static NSString *VroidOverlaySpeechTraceLogPath(void) {
     [NSApp activateIgnoringOtherApps:YES];
 
     if (self.logsRefreshTimer == nil) {
-        self.logsRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:0.75
+        self.logsRefreshTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
                                                                  target:self
                                                                selector:@selector(vroidRefreshLogsWindowContents)
                                                                userInfo:nil
@@ -3365,33 +3407,243 @@ static NSString *VroidOverlaySpeechTraceLogPath(void) {
     }
 }
 
+- (NSString *)vroidInspectorWorkingDirectoryPath {
+    return [[self vroidProjectRootPath] stringByAppendingPathComponent:@"local_agent/tuli_local_brain_lab"];
+}
+
+- (NSDictionary *)vroidFetchInspectorSnapshotWithError:(NSString * __autoreleasing *)errorMessage {
+    NSTask *task = [[NSTask alloc] init];
+    task.launchPath = @"/usr/bin/python3";
+    task.arguments = @[ @"-m", @"tuli_brain", @"inspect", @"--json", @"--recent-lines", @"12", @"--include-raw-paths" ];
+    task.currentDirectoryPath = [self vroidInspectorWorkingDirectoryPath];
+
+    NSPipe *stdoutPipe = [NSPipe pipe];
+    NSPipe *stderrPipe = [NSPipe pipe];
+    task.standardOutput = stdoutPipe;
+    task.standardError = stderrPipe;
+
+    @try {
+        [task launch];
+        [task waitUntilExit];
+    } @catch (NSException *exception) {
+        if (errorMessage != NULL) {
+            *errorMessage = [NSString stringWithFormat:@"Could not launch inspector snapshot: %@", exception.reason ?: @"unknown error"];
+        }
+        return nil;
+    }
+
+    NSData *stdoutData = [[stdoutPipe fileHandleForReading] readDataToEndOfFile];
+    NSData *stderrData = [[stderrPipe fileHandleForReading] readDataToEndOfFile];
+    NSString *stderrText = stderrData.length > 0 ? [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding] : @"";
+
+    if (task.terminationStatus != 0) {
+        if (errorMessage != NULL) {
+            *errorMessage = stderrText.length > 0 ? stderrText : [NSString stringWithFormat:@"Inspector snapshot failed with status %d", task.terminationStatus];
+        }
+        return nil;
+    }
+
+    if (stdoutData.length == 0) {
+        if (errorMessage != NULL) {
+            *errorMessage = @"Inspector snapshot returned no data.";
+        }
+        return nil;
+    }
+
+    NSDictionary *payload = [NSJSONSerialization JSONObjectWithData:stdoutData options:0 error:nil];
+    if (![payload isKindOfClass:[NSDictionary class]]) {
+        if (errorMessage != NULL) {
+            *errorMessage = @"Inspector snapshot returned invalid JSON.";
+        }
+        return nil;
+    }
+    return payload;
+}
+
+- (NSString *)vroidStringOrFallback:(id)value fallback:(NSString *)fallback {
+    return [value isKindOfClass:[NSString class]] && [((NSString *)value) length] > 0 ? value : fallback;
+}
+
+- (NSInteger)vroidIntegerOrZero:(id)value {
+    return [value respondsToSelector:@selector(integerValue)] ? [value integerValue] : 0;
+}
+
+- (double)vroidDoubleOrZero:(id)value {
+    return [value respondsToSelector:@selector(doubleValue)] ? [value doubleValue] : 0.0;
+}
+
+- (NSString *)vroidModelTelemetrySummary:(NSDictionary *)payload fallbackTitle:(NSString *)fallbackTitle {
+    if (![payload isKindOfClass:[NSDictionary class]]) {
+        return [NSString stringWithFormat:@"%@\nContext: - / -   -\nOutput: - / -\nPhase: -\nLast: -\n", fallbackTitle];
+    }
+    NSString *model = [self vroidStringOrFallback:payload[@"model"] fallback:fallbackTitle];
+    NSInteger numCtx = [self vroidIntegerOrZero:payload[@"num_ctx"]];
+    NSInteger numPredict = [self vroidIntegerOrZero:payload[@"num_predict"]];
+    NSInteger contextTokens = payload[@"actual_prompt_tokens"] != nil ? [self vroidIntegerOrZero:payload[@"actual_prompt_tokens"]] : [self vroidIntegerOrZero:payload[@"approx_prompt_tokens"]];
+    double contextPercent = payload[@"context_percent_actual"] != nil ? [self vroidDoubleOrZero:payload[@"context_percent_actual"]] : [self vroidDoubleOrZero:payload[@"context_percent_estimated"]];
+    NSInteger outputTokens = [self vroidIntegerOrZero:payload[@"actual_output_tokens"]];
+    NSString *phase = [self vroidStringOrFallback:payload[@"phase"] fallback:@"-"];
+    NSString *last = @"-";
+    if (payload[@"total_duration"] != nil) {
+        double seconds = [self vroidDoubleOrZero:payload[@"total_duration"]] / 1000000000.0;
+        if (seconds > 0.0) {
+            last = [NSString stringWithFormat:@"%.1fs", seconds];
+        }
+    }
+    NSString *error = [self vroidStringOrFallback:payload[@"error"] fallback:@""];
+    NSMutableString *text = [NSMutableString stringWithFormat:
+        @"%@\nContext: %ld / %ld   %.1f%%\nOutput: %ld / %ld\nPhase: %@\nLast: %@\n",
+        model,
+        (long)contextTokens,
+        (long)numCtx,
+        contextPercent,
+        (long)outputTokens,
+        (long)numPredict,
+        phase,
+        last];
+    if (error.length > 0) {
+        [text appendFormat:@"Error: %@\n", error];
+    }
+    return text;
+}
+
+- (NSString *)vroidTailTextAtPath:(NSString *)path label:(NSString *)label maxLines:(NSUInteger)maxLines {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:path]) {
+        return [NSString stringWithFormat:@"[%@]\nPath: %@\n(no file yet)\n", label, path];
+    }
+    NSString *fullText = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    NSArray<NSString *> *lines = [fullText componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+    NSUInteger start = lines.count > maxLines ? lines.count - maxLines : 0;
+    NSArray<NSString *> *tailLines = [lines subarrayWithRange:NSMakeRange(start, lines.count - start)];
+    NSString *tailText = [tailLines componentsJoinedByString:@"\n"];
+    return [NSString stringWithFormat:@"[%@]\nPath: %@\n%@\n", label, path, tailText];
+}
+
+- (NSString *)vroidInspectorStringFromSnapshot:(NSDictionary *)snapshot errorNote:(NSString *)errorNote {
+    NSDictionary *agent = [snapshot[@"agent"] isKindOfClass:[NSDictionary class]] ? snapshot[@"agent"] : @{};
+    NSDictionary *memoryCounts = [agent[@"memory_counts"] isKindOfClass:[NSDictionary class]] ? agent[@"memory_counts"] : @{};
+    NSDictionary *permissions = [snapshot[@"permissions"] isKindOfClass:[NSDictionary class]] ? snapshot[@"permissions"] : @{};
+    NSDictionary *frontmost = [snapshot[@"frontmost"] isKindOfClass:[NSDictionary class]] ? snapshot[@"frontmost"] : @{};
+    NSDictionary *frontmostObservation = [frontmost[@"observation"] isKindOfClass:[NSDictionary class]] ? frontmost[@"observation"] : @{};
+    NSDictionary *windows = [snapshot[@"windows"] isKindOfClass:[NSDictionary class]] ? snapshot[@"windows"] : @{};
+    NSDictionary *apps = [snapshot[@"apps"] isKindOfClass:[NSDictionary class]] ? snapshot[@"apps"] : @{};
+    NSDictionary *layout = [snapshot[@"layout"] isKindOfClass:[NSDictionary class]] ? snapshot[@"layout"] : @{};
+    NSDictionary *spaces = [snapshot[@"spaces"] isKindOfClass:[NSDictionary class]] ? snapshot[@"spaces"] : @{};
+    NSDictionary *llm = [snapshot[@"llm"] isKindOfClass:[NSDictionary class]] ? snapshot[@"llm"] : @{};
+    NSDictionary *recent = [snapshot[@"recent"] isKindOfClass:[NSDictionary class]] ? snapshot[@"recent"] : @{};
+
+    NSMutableString *text = [NSMutableString stringWithString:@"TULI INSPECTOR\n════════════════════════════════════\n"];
+    if (errorNote.length > 0) {
+        [text appendFormat:@"Snapshot note: %@\n\n", errorNote];
+    }
+
+    [text appendString:@"AGENT\n────────────────────────────────────\n"];
+    [text appendFormat:@"Active model: %@\n", [self vroidStringOrFallback:agent[@"active_model"] fallback:@"-"]];
+    [text appendFormat:@"Router model: %@\n", [self vroidStringOrFallback:agent[@"router_model"] fallback:@"-"]];
+    [text appendFormat:@"Mode: %@\n", [self vroidStringOrFallback:agent[@"mode"] fallback:@"-"]];
+    [text appendFormat:@"Session: %@\n", [self vroidStringOrFallback:agent[@"session_id"] fallback:@"-"]];
+    [text appendFormat:@"Memories: %ld active / %ld total\n", (long)[self vroidIntegerOrZero:memoryCounts[@"active"]], (long)[self vroidIntegerOrZero:memoryCounts[@"total"]]];
+    [text appendFormat:@"Sessions: %ld\n", (long)[self vroidIntegerOrZero:memoryCounts[@"sessions"]]];
+    [text appendString:@"\n"];
+
+    [text appendString:@"macOS\n────────────────────────────────────\n"];
+    [text appendFormat:@"Accessibility: %@\n", [self vroidStringOrFallback:permissions[@"accessibility"] fallback:@"-"]];
+    [text appendFormat:@"Screen Recording: %@\n", [self vroidStringOrFallback:permissions[@"screen_recording"] fallback:@"-"]];
+    [text appendFormat:@"Automation: %@\n", [self vroidStringOrFallback:permissions[@"automation_system_events"] fallback:@"-"]];
+    [text appendFormat:@"Frontmost app: %@\n", [self vroidStringOrFallback:frontmostObservation[@"app_name"] fallback:@"-"]];
+    [text appendFormat:@"Frontmost window: %@\n", [self vroidStringOrFallback:frontmostObservation[@"window_title"] fallback:@"-"]];
+    [text appendFormat:@"Visible windows: %ld\n", (long)[self vroidIntegerOrZero:windows[@"count"]]];
+    [text appendFormat:@"Known apps: %ld\n", (long)[self vroidIntegerOrZero:apps[@"count"]]];
+    [text appendString:@"\n"];
+
+    [text appendString:@"LAYOUT / SPACES\n────────────────────────────────────\n"];
+    [text appendFormat:@"%@\n", [self vroidStringOrFallback:layout[@"summary"] fallback:@"Layout summary unavailable."]];
+    [text appendFormat:@"Spaces success: %@\n", [self vroidIntegerOrZero:spaces[@"success"]] ? @"true" : @"false"];
+    [text appendFormat:@"Current space managed id: %ld\n", (long)[self vroidIntegerOrZero:spaces[@"current_space_managed_id"]]];
+    [text appendFormat:@"Available spaces detected: %ld\n", (long)[self vroidIntegerOrZero:spaces[@"available_spaces_detected"]]];
+    [text appendString:@"\n"];
+
+    [text appendString:@"LLM / CONTEXT\n────────────────────────────────────\n"];
+    [text appendFormat:@"%@\n", [self vroidModelTelemetrySummary:llm[@"router"] fallbackTitle:@"Router"]];
+    [text appendString:@"\n"];
+    [text appendFormat:@"%@\n", [self vroidModelTelemetrySummary:llm[@"chat"] fallbackTitle:@"Chat"]];
+    [text appendString:@"\n"];
+
+    [text appendString:@"RECENT BEHAVIOR\n────────────────────────────────────\n"];
+    [text appendFormat:@"Last route: %@\n", [self vroidStringOrFallback:recent[@"last_route"] fallback:@"-"]];
+    NSArray *errors = [recent[@"errors"] isKindOfClass:[NSArray class]] ? recent[@"errors"] : @[];
+    if (errors.count > 0) {
+        NSDictionary *latestError = [errors lastObject];
+        if ([latestError isKindOfClass:[NSDictionary class]]) {
+            [text appendFormat:@"Last error phase: %@\n", [self vroidStringOrFallback:latestError[@"phase"] fallback:@"-"]];
+            [text appendFormat:@"Last error: %@\n", [self vroidStringOrFallback:latestError[@"error"] fallback:@"-"]];
+        }
+    }
+    NSArray *debugTurns = [recent[@"debug_turns"] isKindOfClass:[NSArray class]] ? recent[@"debug_turns"] : @[];
+    NSUInteger turnCount = MIN((NSUInteger)4, debugTurns.count);
+    if (turnCount > 0) {
+        [text appendString:@"Recent turns:\n"];
+        NSArray *tailTurns = [debugTurns subarrayWithRange:NSMakeRange(debugTurns.count - turnCount, turnCount)];
+        for (NSDictionary *turn in tailTurns) {
+            if (![turn isKindOfClass:[NSDictionary class]]) continue;
+            NSString *command = [self vroidStringOrFallback:turn[@"command"] fallback:@"-"];
+            NSString *mode = [self vroidStringOrFallback:turn[@"mode"] fallback:@"-"];
+            NSString *userText = [self vroidStringOrFallback:turn[@"user_text"] fallback:@""];
+            if (userText.length > 72) {
+                userText = [[userText substringToIndex:72] stringByAppendingString:@"..."];
+            }
+            [text appendFormat:@"- [%@ | %@] %@\n", command, mode, userText];
+        }
+    }
+
+    return text;
+}
+
+- (NSString *)vroidRawLogsPanelStringFromSnapshot:(NSDictionary *)snapshot {
+    NSDictionary *raw = [snapshot[@"raw"] isKindOfClass:[NSDictionary class]] ? snapshot[@"raw"] : @{};
+    NSDictionary *paths = [raw[@"paths"] isKindOfClass:[NSDictionary class]] ? raw[@"paths"] : @{};
+    NSString *overlayPath = [self vroidStringOrFallback:paths[@"overlay_debug_log"] fallback:VroidOverlayOverlayDebugLogPath()];
+    NSString *bridgePath = [self vroidStringOrFallback:paths[@"bridge_debug_log"] fallback:VroidOverlayBridgeDebugLogPath()];
+    NSString *streamPath = [self vroidStringOrFallback:paths[@"event_stream"] fallback:VroidOverlayEventStreamPath()];
+    NSString *overlayText = [self vroidTailTextAtPath:overlayPath label:@"overlay_debug.log" maxLines:24];
+    NSString *bridgeText = [self vroidTailTextAtPath:bridgePath label:@"bridge_debug.log" maxLines:24];
+    NSString *streamText = [self vroidTailTextAtPath:streamPath label:@"openclaw_stream.jsonl" maxLines:24];
+    return [NSString stringWithFormat:@"RAW LOGS\n════════════════════════════════════\n%@\n%@\n%@", overlayText, bridgeText, streamText];
+}
+
 - (void)vroidRefreshLogsWindowContents {
-    if (self.logsTextView == nil) {
+    if (self.logsTextView == nil || self.logsTelemetryTextView == nil) {
         return;
     }
 
-    NSString *overlayPath = VroidOverlayOverlayDebugLogPath();
-    NSString *bridgePath = VroidOverlayBridgeDebugLogPath();
-    NSFileManager *fm = [NSFileManager defaultManager];
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    BOOL shouldRefreshInspector = self.logsCachedInspectorText == nil || (now - self.logsLastInspectorRefreshTime) >= 2.0;
+    static NSDictionary *lastSnapshot = nil;
 
-    NSString *overlayText = @"[overlay_debug.log]\n(no file yet)\n";
-    if ([fm fileExistsAtPath:overlayPath]) {
-        overlayText = [NSString stringWithContentsOfFile:overlayPath encoding:NSUTF8StringEncoding error:nil] ?: @"[overlay_debug.log]\n(could not read file)\n";
+    if (shouldRefreshInspector) {
+        NSString *errorNote = nil;
+        NSDictionary *snapshot = [self vroidFetchInspectorSnapshotWithError:&errorNote];
+        if ([snapshot isKindOfClass:[NSDictionary class]]) {
+            lastSnapshot = snapshot;
+            self.logsCachedInspectorText = [self vroidInspectorStringFromSnapshot:snapshot errorNote:nil];
+        } else if (lastSnapshot != nil) {
+            self.logsCachedInspectorText = [self vroidInspectorStringFromSnapshot:lastSnapshot errorNote:errorNote ?: @"Using stale inspector snapshot."];
+        } else {
+            self.logsCachedInspectorText = [NSString stringWithFormat:@"TULI INSPECTOR\n════════════════════════════════════\nInspector snapshot unavailable.\n%@\n", errorNote ?: @""];
+        }
+        self.logsLastInspectorRefreshTime = now;
     }
 
-    NSString *bridgeText = @"[bridge_debug.log]\n(no file yet)\n";
-    if ([fm fileExistsAtPath:bridgePath]) {
-        bridgeText = [NSString stringWithContentsOfFile:bridgePath encoding:NSUTF8StringEncoding error:nil] ?: @"[bridge_debug.log]\n(could not read file)\n";
-    }
+    self.logsTextView.string = self.logsCachedInspectorText ?: @"TULI INSPECTOR\n════════════════════════════════════\nWaiting for snapshot...\n";
+    [self.logsTextView scrollRangeToVisible:NSMakeRange(0, 0)];
 
-    NSString *combined = [NSString stringWithFormat:
-        @"=== Overlay ===\nPath: %@\n\n%@\n\n=== Bridge ===\nPath: %@\n\n%@",
-        overlayPath,
-        overlayText,
-        bridgePath,
-        bridgeText];
-    self.logsTextView.string = combined;
-    [self.logsTextView scrollRangeToVisible:NSMakeRange(MAX((NSInteger)combined.length - 1, 0), 1)];
+    if ((now - self.logsLastRawRefreshTime) >= 2.0) {
+        NSDictionary *snapshot = lastSnapshot ?: @{};
+        self.logsTelemetryTextView.string = [self vroidRawLogsPanelStringFromSnapshot:snapshot];
+        [self.logsTelemetryTextView scrollRangeToVisible:NSMakeRange(0, 0)];
+        self.logsLastRawRefreshTime = now;
+    }
 }
 
 - (NSString *)vroidProjectRootPath {

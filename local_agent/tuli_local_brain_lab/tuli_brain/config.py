@@ -15,6 +15,13 @@ WORKSPACE_SUPPORT = Path(__file__).resolve().parents[3] / ".tuli_app_support"
 class TuliBrainConfig:
     ollama_url: str = "http://127.0.0.1:11434/api/chat"
     ollama_model: str = "qwen3:1.7b"
+    chat_num_ctx: int = 32768
+    chat_num_predict: int = 600
+    router_url: str = "http://127.0.0.1:11434/api/chat"
+    router_model: str = "qwen3-0.6b-ud-q8-k-xl-local:latest"
+    router_num_ctx: int = 8192
+    router_num_predict: int = 500
+    ollama_keep_alive: str = "10m"
     kokoro_url: str = "http://127.0.0.1:8880/v1/audio/speech"
     kokoro_voice: str = "af_bella"
     speech_output_dir: str = str(APP_SUPPORT / "speech_tmp")
@@ -38,6 +45,19 @@ def _env_value(name: str, default: str) -> str:
     return value if value else default
 
 
+def _env_int_value(name: str, default: int, *, minimum: int = 512, maximum: int = 40960) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < minimum:
+        return default
+    return min(value, maximum)
+
+
 def _resolve_app_support_dir() -> Path:
     override = os.environ.get("TULI_APP_SUPPORT_DIR", "").strip()
     if override:
@@ -58,6 +78,13 @@ def load_config() -> TuliBrainConfig:
     return TuliBrainConfig(
         ollama_url=_env_value("TULI_OLLAMA_URL", defaults.ollama_url),
         ollama_model=_env_value("TULI_OLLAMA_MODEL", defaults.ollama_model),
+        chat_num_ctx=_env_int_value("TULI_CHAT_NUM_CTX", defaults.chat_num_ctx),
+        chat_num_predict=_env_int_value("TULI_CHAT_NUM_PREDICT", defaults.chat_num_predict),
+        router_url=_env_value("TULI_ROUTER_URL", defaults.ollama_url),
+        router_model=_env_value("TULI_ROUTER_MODEL", defaults.router_model),
+        router_num_ctx=_env_int_value("TULI_ROUTER_NUM_CTX", defaults.router_num_ctx),
+        router_num_predict=_env_int_value("TULI_ROUTER_NUM_PREDICT", defaults.router_num_predict),
+        ollama_keep_alive=_env_value("TULI_OLLAMA_KEEP_ALIVE", defaults.ollama_keep_alive),
         kokoro_url=_env_value("TULI_KOKORO_URL", defaults.kokoro_url),
         kokoro_voice=_env_value("TULI_KOKORO_VOICE", defaults.kokoro_voice),
         speech_output_dir=_env_value("TULI_SPEECH_OUTPUT_DIR", str(app_support / "speech_tmp")),

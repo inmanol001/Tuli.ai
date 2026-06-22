@@ -38,6 +38,30 @@ _OPEN_APP_REFERENCE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_NATIVE_WINDOW_PHRASE_RULES: Tuple[Tuple[str, str], ...] = (
+    ("top-left", r"\b(?:arriba\s+a\s+la\s+izquierda|esquina\s+superior\s+izquierda|top\s*-?\s*left)\b"),
+    ("top-right", r"\b(?:arriba\s+a\s+la\s+derecha|esquina\s+superior\s+derecha|top\s*-?\s*right)\b"),
+    ("bottom-left", r"\b(?:abajo\s+a\s+la\s+izquierda|esquina\s+inferior\s+izquierda|bottom\s*-?\s*left)\b"),
+    ("bottom-right", r"\b(?:abajo\s+a\s+la\s+derecha|esquina\s+inferior\s+derecha|bottom\s*-?\s*right)\b"),
+    ("quarters", r"\b(?:organiza(?:r)?|reorganiza(?:r)?|acomoda(?:r)?|ordena(?:r)?)\b.*\b(?:ventanas?|window|windows|cuartos?|quarters?|mosaico|grid|rejilla)\b"),
+    ("quarters", r"\b(?:en\s+cuartos?|quarters?|mosaico|grid|rejilla)\b"),
+    ("fill", r"\b(?:fill|llena(?:r)?|rellena(?:r)?|ocupa(?:r)?\s+(?:la\s+)?pantalla|maximiza(?:r)?|agranda(?:r)?)(?:\s+(?:esta|la)\s+ventana)?\b"),
+    ("center", r"\b(?:center|centra(?:r)?|pon(?:er)?\s+(?:esta|la)?\s*ventana\s+en\s+el\s+centro|al\s+centro)\b"),
+    ("left", r"\b(?:left|izquierda|lado\s+izquierdo|mitad\s+izquierda)\b"),
+    ("right", r"\b(?:right|derecha|lado\s+derecho|mitad\s+derecha)\b"),
+    ("top", r"\b(?:top|arriba|parte\s+superior|mitad\s+superior)\b"),
+    ("bottom", r"\b(?:bottom|abajo|parte\s+inferior|mitad\s+inferior)\b"),
+)
+
+_SPACE_PHRASE_RULES: Tuple[Tuple[str, str], ...] = (
+    ("mission-control", r"\b(?:mission\s+control|control\s+de\s+misiones|vista\s+de\s+escritorios)\b"),
+    ("next", r"\b(?:siguiente|next|próximo|proximo)\b.*\b(?:space|spaces|escritorio|desktop)\b"),
+    ("next", r"\b(?:cambia|ve|mueve(?:te)?|pasa)\b.*\b(?:space|spaces|escritorio|desktop)\b.*\b(?:siguiente|next|próximo|proximo)\b"),
+    ("previous", r"\b(?:anterior|previous|previo|atrás|atras)\b.*\b(?:space|spaces|escritorio|desktop)\b"),
+    ("previous", r"\b(?:cambia|ve|mueve(?:te)?|pasa)\b.*\b(?:space|spaces|escritorio|desktop)\b.*\b(?:anterior|previous|previo|atrás|atras)\b"),
+    ("status", r"\b(?:estado|status)\b.*\b(?:space|spaces|escritorios|desktops)\b"),
+)
+
 
 def _normalize_text(text: str) -> str:
     return " ".join(text.strip().split())
@@ -75,6 +99,39 @@ def _parse_open_app_candidate(text: str) -> Optional[Tuple[str, ...]]:
         return None
 
     return (app_text,)
+
+
+def _parse_native_window_candidate(text: str) -> Optional[Tuple[str, ...]]:
+    lowered = text.lower().strip(" ,.;:!?")
+    if not lowered:
+        return None
+
+    has_window_context = re.search(
+        r"\b(?:ventana|ventanas|window|windows|layout|organiza|reorganiza|acomoda|ordena|pon|ponla|mueve|muévela|muevela|coloca|colócala|colocala|ubica|centra|llena|maximiza)\b",
+        lowered,
+    )
+    if not has_window_context:
+        return None
+
+    for action, pattern in _NATIVE_WINDOW_PHRASE_RULES:
+        if re.search(pattern, lowered):
+            return ("native", action)
+    return None
+
+
+def _parse_space_candidate(text: str) -> Optional[Tuple[str, ...]]:
+    lowered = text.lower().strip(" ,.;:!?")
+    if not lowered:
+        return None
+
+    desktop_match = re.search(r"\b(?:escritorio|desktop|space)\s+(?P<number>[1-9])\b", lowered)
+    if desktop_match and re.search(r"\b(?:ve|ir|cambia|cambiar|mueve(?:te)?|pasa|abre|switch|go)\b", lowered):
+        return (desktop_match.group("number"),)
+
+    for action, pattern in _SPACE_PHRASE_RULES:
+        if re.search(pattern, lowered):
+            return (action,)
+    return None
 
 
 def _parsed_command(
@@ -181,6 +238,34 @@ def parse_command(user_text: str, registry: CommandRegistry = DEFAULT_COMMAND_RE
             confidence=0.9,
             parse_reason="explicit deep mode request",
             requested_mode="thinking",
+        )
+
+    space_args = _parse_space_candidate(candidate)
+    if space_args is not None:
+        return _parsed_command(
+            raw_text=raw_text,
+            is_command=True,
+            command_name="space",
+            command_args=space_args,
+            command_kind="system",
+            confidence=0.84,
+            parse_reason="space control phrase",
+            danger_level="safe",
+            requested_mode="instant",
+        )
+
+    native_window_args = _parse_native_window_candidate(candidate)
+    if native_window_args is not None:
+        return _parsed_command(
+            raw_text=raw_text,
+            is_command=True,
+            command_name="window",
+            command_args=native_window_args,
+            command_kind="system",
+            confidence=0.84,
+            parse_reason="native window tiling phrase",
+            danger_level="safe",
+            requested_mode="instant",
         )
 
     open_app_args = _parse_open_app_candidate(candidate)

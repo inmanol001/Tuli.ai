@@ -12,6 +12,7 @@ from .actions.event_bridge import emit_response_events
 from .activity import ActivityWatcher
 from .brain import respond
 from .config import load_config
+from .debug import build_inspector_snapshot
 from .macos_control import MacOSControl
 from .memory.memory_policy import should_store_episodic_turn
 from .memory.sqlite_memory import SQLiteMemoryStore
@@ -110,6 +111,11 @@ def build_parser() -> argparse.ArgumentParser:
     context_parser = sub.add_parser("context", help="Print the prompt context that would be sent to Ollama.")
     context_parser.add_argument("user_text", help="User text for context retrieval.")
 
+    inspect_parser = sub.add_parser("inspect", help="Print a structured Tuli inspector snapshot.")
+    inspect_parser.add_argument("--json", action="store_true", help="Print inspector snapshot as JSON.")
+    inspect_parser.add_argument("--recent-lines", type=int, default=12, help="Number of recent stream/debug lines to summarize.")
+    inspect_parser.add_argument("--include-raw-paths", action="store_true", help="Include raw file paths in the snapshot.")
+
     speech_parser = sub.add_parser("speech", help="Use local Kokoro to synthesize speech.")
     speech_sub = speech_parser.add_subparsers(dest="speech_command", required=True)
     synth_parser = speech_sub.add_parser("synthesize", help="Synthesize text with Kokoro local.")
@@ -204,6 +210,15 @@ def main() -> int:
         store = SQLiteMemoryStore(config.memory_db_path)
         store.initialize()
         _print_json(build_context(args.user_text, store).to_dict())
+        return 0
+
+    if args.command == "inspect":
+        snapshot = build_inspector_snapshot(
+            load_config(),
+            recent_lines=args.recent_lines,
+            include_raw_paths=args.include_raw_paths,
+        )
+        _print_json(snapshot)
         return 0
 
     if args.command == "activity":

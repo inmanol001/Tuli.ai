@@ -43,6 +43,10 @@ _ALWAYS_SAFE_COMMANDS = {
     "summarize",
     "pause",
     "resume",
+    "permissions",
+    "windows",
+    "layout",
+    "space",
 }
 
 
